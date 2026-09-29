@@ -23,10 +23,19 @@ The fit aborts with :class:`CalibrationError` when no point is valid, when
 no pair with distinct theoretical m/z exists, when fewer than three points
 are inliers, or when the least-squares slope is not positive (the inverse
 transform needs a strictly positive slope).
+
+Observed m/z values may be as large as the float range allows. Every
+floating-point step of the fit (pairwise slope/intercept, median averages,
+least-squares accumulation, residual evaluation and the inverse transform)
+is therefore evaluated with exponent-scaled arithmetic so that an
+intermediate term which merely passes through the overflow regime cannot
+produce a spurious infinity or NaN: only results that are genuinely outside
+the finite float range overflow.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from .adduct import AdductError, apply_adduct, parse_adduct
@@ -106,13 +115,64 @@ def theoretical_mz(formula: str, adduct: str, charge: int) -> float:
     return (monoisotopic_mass(adjusted) - charge * ELECTRON_MASS_DA) / abs(charge)
 
 
+def _stable_fma(a: float, b: float, c: float) -> float:
+    """Fused-multiply-add ``a*b + c`` without spurious overflow.
+
+    A plain ``a * b + c`` can overflow even when the true sum is finite and
+    representable (e.g. a huge product that is nearly cancelled by ``c``).
+    The operands are split into a common exponent scale so every partial
+    term stays in the finite range; the scale is restored afterwards. An
+    infinity is returned only when the mathematical result itself exceeds
+    the finite float range. Inputs that are already non-finite fall through
+    to the ordinary IEEE expression.
+    """
+    if not (math.isfinite(a) and math.isfinite(b) and math.isfinite(c)):
+        return a * b + c
+    if a == 0.0 or b == 0.0:
+        return c + 0.0  # signed zero of the addend, never an overflow
+
+    pa, ea = math.frexp(a)
+    pb, eb = math.frexp(b)
+    pc, ec = math.frexp(c) if c != 0.0 else (0.0, 0)
+
+    # Work at the scale of the product: a*b = pa*pb * 2^(ea+eb) and
+    # c = pc * 2^ec, and both are evaluated as fractions of 2^q.
+    q = max(ea + eb, ec)
+    scaled_product = math.ldexp(pa * pb, ea + eb - q)
+    scaled_addend = (
+        math.ldexp(pc, ec - q) if c != 0.0 else 0.0
+    )
+    try:
+        return math.ldexp(scaled_product + scaled_addend, q)
+    except OverflowError:
+        return math.copysign(math.inf, a * b + c)
+
+
+def _stable_sum2(a: float, b: float) -> float:
+    """Stable two-operand difference used for residual evaluation.
+
+    Residuals are differences of similarly sized quantities. For finite
+    operands the IEEE ``+`` (with the second operand negated) already
+    overflows only when the mathematical result genuinely exceeds the
+    finite range: operands of opposite sign can never overflow, since the
+    magnitude of their sum is no larger than the larger operand. Keeping
+    this as an explicit call site documents the invariant and lets
+    non-finite operands follow ordinary IEEE propagation.
+    """
+    return a + b
+
+
 def _median(values: list[float]) -> float:
-    """Median of a non-empty list (average of the two middle values on ties)."""
+    """Median of a non-empty list (average of the two middle values on ties).
+
+    The even-length average is taken as the mean of two half-size terms so
+    that averaging two huge, near-cancelling middle values cannot overflow.
+    """
     ordered = sorted(values)
     mid = len(ordered) // 2
     if len(ordered) % 2:
         return ordered[mid]
-    return (ordered[mid - 1] + ordered[mid]) / 2.0
+    return _stable_sum2(ordered[mid - 1] / 2.0, ordered[mid] / 2.0)
 
 
 def _point_result_invalid(point: CalibrationPoint, exc: Exception) -> PointResidual:
@@ -174,18 +234,26 @@ def calibrate_mass_axis(
 
     # Robust initial model: median of pairwise slopes (Theil–Sen) and the
     # median intercept of the line through each pair. Only pairs with
-    # distinct theoretical m/z define a finite slope.
+    # distinct theoretical m/z define a finite slope. A pair whose slope or
+    # intercept is non-finite (e.g. a theoretical m/z beyond the float
+    # range) cannot define a usable affine line and is skipped.
     slopes: list[float] = []
     intercepts: list[float] = []
     for i in range(len(valid) - 1):
         x_i, y_i = valid[i]
         for j in range(i + 1, len(valid)):
             x_j, y_j = valid[j]
-            if x_i == x_j:
+            if x_i == x_j or not (math.isfinite(x_i) and math.isfinite(x_j)):
                 continue
             pair_slope = (y_j - y_i) / (x_j - x_i)
+            # y_i - pair_slope * x_i evaluated stably: for very close
+            # (x_i, x_j) the product can run through the overflow regime
+            # even though the true intercept stays in range.
+            pair_intercept = _stable_fma(-pair_slope, x_i, y_i)
+            if not (math.isfinite(pair_slope) and math.isfinite(pair_intercept)):
+                continue
             slopes.append(pair_slope)
-            intercepts.append(y_i - pair_slope * x_i)
+            intercepts.append(pair_intercept)
 
     if not slopes:
         raise CalibrationError(
@@ -199,8 +267,15 @@ def calibrate_mass_axis(
 
     inlier_flags: list[bool] = []
     for x, y in valid:
-        residual = y - (initial_slope * x + initial_intercept)
-        residual_ppm = residual / x * 1e6
+        # Stabilized prediction: initial_slope * x + initial_intercept can
+        # otherwise overflow for large theoretical m/z even when the
+        # subtraction against y leaves a small residual.
+        predicted = _stable_fma(initial_slope, x, initial_intercept)
+        residual = _stable_sum2(y, -predicted)
+        if math.isfinite(residual) and x > 0.0:
+            residual_ppm = residual / x * 1e6
+        else:
+            residual_ppm = math.inf
         inlier_flags.append(abs(residual_ppm) <= tolerance_ppm + _PPM_EPS)
 
     inlier_count = sum(inlier_flags)
@@ -215,27 +290,59 @@ def calibrate_mass_axis(
 
     inlier_x = [x for (x, _), flag in zip(valid, inlier_flags) if flag]
     inlier_y = [y for (_, y), flag in zip(valid, inlier_flags) if flag]
-    mean_x = sum(inlier_x) / inlier_count
-    mean_y = sum(inlier_y) / inlier_count
-    sxx = sum((x - mean_x) ** 2 for x in inlier_x)
-    sxy = sum(
-        (x - mean_x) * (y - mean_y)
-        for x, y in zip(inlier_x, inlier_y)
-    )
-    if sxx <= 0.0:
+
+    # Ordinary least squares in a common exponent-scaled space. Naive
+    # sum-of-squares accumulation overflows for legitimate large-magnitude
+    # points (each (x-mean)**2 term can exceed the float range, and inf-inf
+    # cancellation in sxy/sxx would otherwise yield a NaN slope and NaN
+    # residuals). Normalising x and y by their own binary exponents keeps
+    # every accumulated term below 2, and the scale is restored analytically
+    # in the slope and intercept.
+    sx = math.ldexp(1.0, math.frexp(max(abs(v) for v in inlier_x))[1] - 1)
+    sy = math.ldexp(1.0, math.frexp(max(abs(v) for v in inlier_y))[1] - 1)
+    ux = [x / sx for x in inlier_x]
+    uy = [y / sy for y in inlier_y]
+    if not all(math.isfinite(v) for v in (*ux, *uy)):
+        raise CalibrationError(
+            "degenerate_inliers",
+            "The inlier points contain non-finite theoretical or observed "
+            "m/z values, so a least-squares line cannot be fitted",
+        )
+    n = inlier_count
+    mean_u = math.fsum(ux) / n
+    mean_v = math.fsum(uy) / n
+    suu = math.fsum((u - mean_u) ** 2 for u in ux)
+    suv = math.fsum((u - mean_u) * (v - mean_v) for u, v in zip(ux, uy))
+    if suu <= 0.0:
         raise CalibrationError(
             "degenerate_inliers",
             "The inlier points share one theoretical m/z, so a "
             "least-squares slope is undefined",
         )
-    slope = sxy / sxx
-    intercept = mean_y - slope * mean_x
-    if not slope > 0.0:
+    # slope = (sy/sx) * suv/suu, with the factors combined through ldexp to
+    # avoid an intermediate overflow when the true slope is finite.
+    factor, factor_exp = math.frexp(sy / sx)
+    q, q_exp = math.frexp(suv / suu)
+    try:
+        slope = math.ldexp(factor * q, factor_exp + q_exp)
+    except OverflowError:
+        slope = math.copysign(math.inf, suv)
+    mean_x = mean_u * sx
+    mean_y = mean_v * sy
+    intercept = _stable_fma(-slope, mean_x, mean_y)
+    if not (math.isfinite(slope) and slope > 0.0):
         raise CalibrationError(
             "non_positive_slope",
             f"The least-squares calibration slope is {slope:.6g}, which is "
-            "not positive; the inverse transform is undefined (check the "
-            "calibration points for swapped or inconsistent m/z values)",
+            "not a finite positive number; the inverse transform is "
+            "undefined (check the calibration points for swapped or "
+            "inconsistent m/z values)",
+        )
+    if not math.isfinite(intercept):
+        raise CalibrationError(
+            "degenerate_inliers",
+            "The least-squares calibration intercept is not finite, so the "
+            "fitted model cannot represent a stable calibration",
         )
 
     # Final-model residuals for every valid point; the inlier/outlier flag
@@ -245,9 +352,12 @@ def calibrate_mass_axis(
         if not result.valid:
             continue
         (x, y), flag = next(valid_iter)
-        residual = y - (slope * x + intercept)
+        residual = _stable_sum2(y, -_stable_fma(slope, x, intercept))
         result.residual_mz = residual
-        result.residual_ppm = residual / x * 1e6
+        if math.isfinite(residual) and math.isfinite(x) and x > 0.0:
+            result.residual_ppm = residual / x * 1e6
+        else:
+            result.residual_ppm = math.inf
         result.inlier = flag
 
     return MassCalibrationFit(
@@ -260,8 +370,42 @@ def calibrate_mass_axis(
 
 
 def inverse_predict(fit: MassCalibrationFit, mz: float) -> float:
-    """Apply the fitted inverse transform to one observed m/z."""
-    return (mz - fit.intercept) / fit.slope
+    """Apply the fitted inverse transform to one observed m/z.
+
+    ``(mz - intercept) / slope`` is stabilized so the subtraction cannot
+    overflow merely because a negative intercept is being removed: the
+    quotient is evaluated in a common binary scale of the three operands.
+    The result overflows only when the calibrated m/z itself lies outside
+    the finite float range.
+    """
+    slope = fit.slope
+    intercept = fit.intercept
+    # Fast path: a subtraction of finite numbers is infinite only if the
+    # true difference overflows, in which case a direct quotient is needed.
+    diff = _stable_sum2(mz, -intercept)
+    if math.isfinite(diff):
+        return diff / slope
+
+    if not (math.isfinite(mz) and math.isfinite(intercept) and math.isfinite(slope)):
+        return (mz - intercept) / slope
+
+    # Shared scale at the largest operand: all three scaled operands stay
+    # below 2, so the subtraction stays finite. The scale cancels in the
+    # quotient ((mz-b)/scale)/(slope/scale) == (mz-b)/slope, so the result
+    # overflows only when the calibrated m/z itself is out of finite range.
+    emax = max(
+        math.frexp(mz)[1],
+        math.frexp(intercept)[1],
+        math.frexp(slope)[1],
+    )
+    num = math.ldexp(mz, 1 - emax) - math.ldexp(intercept, 1 - emax)
+    den = math.ldexp(slope, 1 - emax)
+    if den == 0.0:
+        if num == 0.0:
+            return 0.0
+        positive = (num > 0.0) == (slope > 0.0)
+        return math.inf if positive else -math.inf
+    return num / den
 
 
 __all__ = [

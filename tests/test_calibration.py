@@ -1,10 +1,13 @@
 """Unit tests for the robust mass-axis calibration module."""
 
+import math
+
 import pytest
 
 from app.calibration import (
     CalibrationError,
     CalibrationPoint,
+    MassCalibrationFit,
     calibrate_mass_axis,
     inverse_predict,
     theoretical_mz,
@@ -225,3 +228,108 @@ def test_residual_sign_convention():
     target = next(p for p in fit.points if p.formula == spec[0])
     assert target.residual_mz > 0
     assert target.residual_ppm > 0
+
+
+def _huge_identity_points(multipliers, base_count=10**153):
+    """Three finite, distinct, astronomically large points on y = x."""
+    rows = []
+    for i, mult in enumerate(multipliers):
+        formula = f"C{base_count * mult}"
+        x = theoretical_mz(formula, "+H", 1)
+        assert math.isfinite(x)
+        rows.append((x, (formula, "+H", 1)))
+    return make_points(rows)
+
+
+def test_large_observations_do_not_overflow_ols_accumulation():
+    # Naive sum-of-squares accumulation at this scale overflows (sxx/sxy
+    # -> inf with inf - inf cancellation), yielding a NaN slope. The scaled
+    # fit must still recover the exact identity model with finite residuals.
+    points = _huge_identity_points((1, 2, 3))
+    fit = calibrate_mass_axis(points, 5.0)
+    assert math.isfinite(fit.slope) and fit.slope == pytest.approx(1.0, rel=1e-12)
+    assert math.isfinite(fit.intercept)
+    assert fit.inlier_count == 3
+    for p in fit.points:
+        assert p.inlier is True
+        assert math.isfinite(p.residual_mz)
+        assert math.isfinite(p.residual_ppm)
+        assert p.residual_ppm == pytest.approx(0.0, abs=1e-6)
+
+
+def test_large_observations_scale_that_raised_overflow_error():
+    # At ~3e154 the raw ``(x - mean) ** 2`` term itself raises OverflowError;
+    # the stabilized fit must not propagate that as a 500-class failure.
+    points = _huge_identity_points((3, 6, 9))
+    fit = calibrate_mass_axis(points, 10.0)
+    assert math.isfinite(fit.slope) and fit.slope > 0.0
+    assert math.isfinite(fit.intercept)
+    assert fit.inlier_count == 3
+
+
+def test_large_points_with_finite_slope_and_intercept():
+    # slope 2, intercept around -1e154: the pairwise intercept term
+    # slope * x also runs through the overflow regime for close pairs.
+    base = 10**153
+    rows = []
+    for mult in (1, 2, 3):
+        formula = f"C{base * mult}"
+        x = theoretical_mz(formula, "+H", 1)
+        rows.append((2.0 * x - 1e154, (formula, "+H", 1)))
+    fit = calibrate_mass_axis(make_points(rows), 10.0)
+    assert math.isfinite(fit.slope) and fit.slope == pytest.approx(2.0, rel=1e-12)
+    assert math.isfinite(fit.intercept) and fit.intercept == pytest.approx(
+        -1e154, rel=1e-12
+    )
+
+
+def test_inverse_predict_negative_intercept_subtraction_overflow():
+    # (mz - intercept) spuriously overflows to inf for a large negative
+    # intercept even though the subsequent division yields a finite
+    # calibrated m/z. The stabilized inverse must return that value.
+    fit = MassCalibrationFit(
+        slope=1.09e306,
+        intercept=-1.7e308,
+        valid_point_count=3,
+        inlier_count=3,
+        points=[],
+    )
+    result = inverse_predict(fit, 1.7e308)
+    assert math.isfinite(result)
+    # The same subtraction in plain arithmetic spuriously overflows, so the
+    # old implementation returned inf instead of the representable quotient.
+    assert (1.7e308 - (-1.7e308)) / 1.09e306 == math.inf
+    # True quotient, computed in a scaled space that does not overflow.
+    assert result == pytest.approx(311.92660550458714, rel=1e-12)
+
+
+def test_inverse_predict_normal_range_unchanged():
+    fit = MassCalibrationFit(
+        slope=1.000003,
+        intercept=-0.0006,
+        valid_point_count=3,
+        inlier_count=3,
+        points=[],
+    )
+    for mz in (50.0, 181.070665, 500.0):
+        assert inverse_predict(fit, mz) == pytest.approx(
+            (mz - (-0.0006)) / 1.000003, rel=1e-15
+        )
+
+
+def test_inverse_predict_genuinely_unrepresentable_still_overflows():
+    # When the mathematical calibrated m/z itself exceeds the finite range,
+    # overflow to a signed infinity (rather than NaN or a wrong finite value)
+    # is the correct IEEE outcome.
+    pos = MassCalibrationFit(
+        slope=1.0, intercept=-1.7e308, valid_point_count=3, inlier_count=3, points=[]
+    )
+    assert inverse_predict(pos, 1.7976931348623157e308) == math.inf
+    neg = MassCalibrationFit(
+        slope=1e-100,
+        intercept=1.79e308,
+        valid_point_count=3,
+        inlier_count=3,
+        points=[],
+    )
+    assert inverse_predict(neg, 1.0) == -math.inf

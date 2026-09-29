@@ -1,5 +1,7 @@
 """API tests for POST /api/v1/mass-calibrate."""
 
+import math
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -296,6 +298,80 @@ def test_observed_mz_must_be_positive(client):
         "mz": [100.0],
     }
     assert client.post("/api/v1/mass-calibrate", json=payload).status_code == 422
+
+
+def test_large_legal_observations_fit_and_calibrate(client):
+    # Regression: astronomical but finite observed m/z (~1e154) used to
+    # overflow the inlier least-squares accumulators (inf slope, NaN
+    # residuals and a spurious 422). The representable model must come back.
+    base = 10**153
+    points = []
+    for mult in (1, 2, 3):
+        formula = f"C{base * mult}"
+        x = theoretical_mz(formula, "+H", 1)
+        points.append(
+            {
+                "observed_mz": x,
+                "formula": formula,
+                "adduct": "+H",
+                "charge": 1,
+            }
+        )
+    payload = {
+        "calibration_points": points,
+        "tolerance_ppm": 5.0,
+        "mz": [theoretical_mz(f"C{base}", "+H", 1)],
+    }
+    resp = client.post("/api/v1/mass-calibrate", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert math.isfinite(body["slope"]) and body["slope"] > 0
+    assert math.isfinite(body["intercept"])
+    assert body["inlier_count"] == 3
+    for point in body["calibration_points"]:
+        assert point["valid"] is True
+        assert point["inlier"] is True
+        assert math.isfinite(point["theoretical_mz"])
+        assert math.isfinite(point["residual_mz"])
+        assert math.isfinite(point["residual_ppm"])
+    item = body["calibrated_mz"][0]
+    assert math.isfinite(item["calibrated_mz"])
+    assert item["calibrated_mz"] == pytest.approx(
+        theoretical_mz(f"C{base}", "+H", 1), rel=1e-6
+    )
+
+
+def test_large_negative_intercept_calibration_is_returned(client):
+    # Regression: a finite fitted model with a large negative intercept made
+    # the inverse subtraction overflow before the division, so an otherwise
+    # representable calibrated m/z came back as Infinity.
+    slope, intercept = 2.0, -1.7e308
+    xtarget = 0.95 * 1.7976931348623157e308 / slope
+    c0 = int(xtarget / 12.0)
+    points = []
+    xs = []
+    for k in range(3):
+        formula = f"C{c0 + k * 10**292}"
+        x = theoretical_mz(formula, "+H", 1)
+        y = slope * x + intercept
+        assert math.isfinite(y) and y > 0
+        xs.append(x)
+        points.append(
+            {"observed_mz": y, "formula": formula, "adduct": "+H", "charge": 1}
+        )
+    payload = {
+        "calibration_points": points,
+        "tolerance_ppm": 1e4,
+        "mz": [1.7e308],
+    }
+    resp = client.post("/api/v1/mass-calibrate", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert math.isfinite(body["slope"])
+    assert math.isfinite(body["intercept"])
+    calibrated = body["calibrated_mz"][0]["calibrated_mz"]
+    assert math.isfinite(calibrated)
+    assert calibrated == pytest.approx(1.7e308, rel=1e-6)
 
 
 def test_request_logged(client):
